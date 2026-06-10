@@ -1,0 +1,113 @@
+name: Claude Code Review
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  claude-review:
+    if: |
+      github.event.issue.pull_request != null &&
+      contains(github.event.comment.body, '@claude')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析指令
+        id: parse
+        run: |
+          COMMENT="${{ github.event.comment.body }}"
+          INSTRUCTION=$(echo "$COMMENT" | sed 's/@claude//' | xargs)
+          echo "instruction=$INSTRUCTION" >> $GITHUB_OUTPUT
+
+      - name: 获取 PR diff
+        id: diff
+        run: |
+          PR_NUMBER=${{ github.event.issue.number }}
+          gh pr diff $PR_NUMBER > /tmp/pr_diff.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 调用 DeepSeek API
+        id: review
+        run: |
+          DIFF=$(cat /tmp/pr_diff.txt)
+          INSTRUCTION="${{ steps.parse.outputs.instruction }}"
+
+          PROMPT="你是一个资深工程师，正在 review 一个 Pull Request。
+
+## 你的 review 原则
+- 聚焦重要问题，不吹毛求疵
+- 发现 bug 和安全漏洞时必须明确指出
+- 给出具体的改进建议，不只说"这里有问题"
+- 肯定做得好的地方
+- 用中文回复
+
+## 用户的具体指令
+${INSTRUCTION:-请对这个 PR 做全面的 code review}
+
+## PR 的代码变更
+\`\`\`diff
+${DIFF}
+\`\`\`
+
+## 输出格式
+用以下结构回复（Markdown）：
+
+### 总体评价
+一句话概括这个 PR 的质量
+
+### 🔴 必须修改
+（如有 bug、安全问题、逻辑错误）
+
+### 🟡 建议改进
+（代码质量、可读性、最佳实践）
+
+### 🟢 做得好的地方
+（值得保留的好写法）
+
+### 💡 其他建议
+（可选，架构或设计层面的思考）"
+
+          RESPONSE=$(curl -s https://api.deepseek.com/chat/completions \
+            -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"deepseek-chat\",
+              \"max_tokens\": 4096,
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": $(echo "$PROMPT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+              }]
+            }")
+
+          echo "$RESPONSE" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          print(data['choices'][0]['message']['content'])
+          " > /tmp/review_result.txt
+
+      - name: 发布 review 评论
+        run: |
+          REVIEW=$(cat /tmp/review_result.txt)
+          COMMENT_BODY="## 🤖 AI Code Review
+
+${REVIEW}
+
+---
+*由 DeepSeek 自动生成 · 触发指令：\`${{ github.event.comment.body }}\`*"
+
+          gh pr comment ${{ github.event.issue.number }} \
+            --body "$COMMENT_BODY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
